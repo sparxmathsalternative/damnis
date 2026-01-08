@@ -955,6 +955,22 @@ def logout_user():
 
 # ============= DISCORD API ENDPOINTS =============
 
+@app.route('/api/test/email', methods=['GET'])
+def test_email():
+    """Test email sending"""
+    try:
+        test_email_addr = request.args.get('email', 'test@example.com')
+        code = '123456'
+        
+        result = send_verification_email(test_email_addr, code)
+        
+        if result:
+            return jsonify({'success': True, 'message': f'Test email sent to {test_email_addr}'})
+        else:
+            return jsonify({'success': False, 'message': 'Email failed - check server logs'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Public health check"""
