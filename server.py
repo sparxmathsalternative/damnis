@@ -1,23 +1,43 @@
 import discord
 from discord.ext import commands
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template_string
 from flask_cors import CORS
 import asyncio
 import threading
 import base64
 import os
+import secrets
+import hashlib
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from io import BytesIO
 import aiohttp
 from collections import deque
-import time
+from pymongo import MongoClient
+from datetime import datetime
 
 # Configuration from environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-API_SECRET = os.getenv('API_SECRET_KEY', 'change-me-in-production')
 PORT = int(os.getenv('PORT', 5000))
+MONGODB_URI = os.getenv('MONGODB')
+APP_EMAIL = os.getenv('APP_EMAIL')
+APP_PASS = os.getenv('APP_PASS')
 
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is required!")
+if not MONGODB_URI:
+    raise ValueError("MONGODB environment variable is required!")
+if not APP_EMAIL or not APP_PASS:
+    raise ValueError("APP_EMAIL and APP_PASS environment variables are required!")
+
+# MongoDB setup
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client['voidagon']
+users_collection = db['users']
+sessions_collection = db['sessions']
+verification_codes = db['verification_codes']
 
 # Bot setup
 intents = discord.Intents.default()
@@ -30,7 +50,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 app = Flask(__name__)
 CORS(app)
 
-# Store recent messages per channel (channel_id: deque of messages)
+# Store recent messages per channel
 message_cache = {}
 MAX_CACHED_MESSAGES = 50
 
@@ -41,15 +61,296 @@ webhooks_cache = {}
 bot_status = {
     'ready': False,
     'start_time': None,
-    'latency': 0,
-    'guilds_count': 0,
     'last_message_time': None
 }
 
-def verify_api_key(req):
-    """Simple API key verification"""
+def hash_password(password):
+    """Hash password with SHA256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_token():
+    """Generate secure random token"""
+    return secrets.token_urlsafe(32)
+
+def generate_verification_code():
+    """Generate 6-digit verification code"""
+    return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
+
+def send_verification_email(email, code):
+    """Send verification code via email"""
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = 'NullChat - Verify Your Email'
+        msg['From'] = APP_EMAIL
+        msg['To'] = email
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+                
+                body {{
+                    margin: 0;
+                    padding: 20px;
+                    background-color: #f8f9fa;
+                    font-family: 'IBM Plex Mono', monospace, Arial, sans-serif;
+                }}
+                
+                .email-container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background-color: #ffffff;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+                    border: 1px solid #e9ecef;
+                }}
+                
+                .header {{
+                    padding: 30px 40px 20px;
+                    text-align: center;
+                    background: linear-gradient(135deg, #ff0d9e 0%, #0019a3 100%);
+                    color: white;
+                }}
+                
+                .nullchat-logo {{
+                    font-family: 'IBM Plex Mono', monospace;
+                    font-size: 42px;
+                    font-weight: 600;
+                    letter-spacing: -1px;
+                    margin: 0;
+                    line-height: 1;
+                }}
+                
+                .tagline {{
+                    font-size: 14px;
+                    opacity: 0.9;
+                    margin-top: 8px;
+                    font-weight: 400;
+                }}
+                
+                .content {{
+                    padding: 40px;
+                    color: #333333;
+                    line-height: 1.6;
+                }}
+                
+                .greeting {{
+                    font-size: 18px;
+                    margin-bottom: 25px;
+                    color: #0019a3;
+                    font-weight: 500;
+                }}
+                
+                .verification-section {{
+                    background: #f8f9ff;
+                    border: 2px solid #e0e7ff;
+                    border-radius: 8px;
+                    padding: 25px;
+                    margin: 30px 0;
+                    text-align: center;
+                }}
+                
+                .code-label {{
+                    font-size: 14px;
+                    color: #666;
+                    margin-bottom: 10px;
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
+                }}
+                
+                .verification-code {{
+                    font-family: 'IBM Plex Mono', monospace;
+                    font-size: 42px;
+                    font-weight: 600;
+                    letter-spacing: 10px;
+                    color: #0019a3;
+                    margin: 15px 0;
+                    padding: 10px;
+                    background: white;
+                    border-radius: 6px;
+                    border: 1px solid #d0d7ff;
+                }}
+                
+                .expiry-note {{
+                    font-size: 14px;
+                    color: #ff0d9e;
+                    margin-top: 15px;
+                    font-weight: 500;
+                }}
+                
+                .highlight-box {{
+                    background: linear-gradient(135deg, #ff0d9e08 0%, #0019a308 100%);
+                    border-left: 4px solid #0019a3;
+                    padding: 20px;
+                    margin: 30px 0;
+                    font-size: 14px;
+                    line-height: 1.7;
+                }}
+                
+                .highlight-title {{
+                    color: #0019a3;
+                    font-weight: 600;
+                    margin-bottom: 8px;
+                }}
+                
+                .steps {{
+                    margin: 30px 0;
+                    padding-left: 20px;
+                }}
+                
+                .steps li {{
+                    margin-bottom: 15px;
+                    padding-left: 10px;
+                }}
+                
+                .warning {{
+                    background-color: #fff5f7;
+                    border: 1px solid #ffe3e9;
+                    padding: 15px;
+                    border-radius: 6px;
+                    margin: 25px 0;
+                    font-size: 14px;
+                }}
+                
+                .footer {{
+                    padding: 25px 40px;
+                    background-color: #f8f9fa;
+                    border-top: 1px solid #e9ecef;
+                    text-align: center;
+                    font-size: 12px;
+                    color: #666;
+                    line-height: 1.5;
+                }}
+                
+                .footer-logo {{
+                    font-family: 'IBM Plex Mono', monospace;
+                    font-size: 18px;
+                    font-weight: 600;
+                    background: linear-gradient(135deg, #ff0d9e 0%, #0019a3 100%);
+                    -webkit-background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    margin-bottom: 10px;
+                }}
+                
+                .app-description {{
+                    font-size: 13px;
+                    margin: 15px 0;
+                    color: #555;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="email-container">
+                <div class="header">
+                    <h1 class="nullchat-logo">nullchat</h1>
+                    <div class="tagline">Discord-to-web bridge</div>
+                </div>
+                
+                <div class="content">
+                    <div class="greeting">
+                        Hello,
+                    </div>
+                    
+                    <p>Thank you for creating your NullChat account! To complete your setup and start using our Discord-to-web bridge service, please verify your email address.</p>
+                    
+                    <div class="verification-section">
+                        <div class="code-label">Verification Code</div>
+                        <div class="verification-code">{code}</div>
+                        <div class="expiry-note">⏰ Expires in 15 minutes</div>
+                    </div>
+                    
+                    <p>Enter this code in the NullChat app to activate your account.</p>
+                    
+                    <div class="highlight-box">
+                        <div class="highlight-title">
+                            ✨ Why NullChat?
+                        </div>
+                        Access Discord even when it's blocked. Our web client bridges your Discord experience to any browser, giving you uninterrupted access to your communities.
+                    </div>
+                    
+                    <p><strong>Next steps:</strong></p>
+                    <ol class="steps">
+                        <li>Return to NullChat app/web client</li>
+                        <li>Enter the verification code above</li>
+                        <li>Start chatting through our secure web bridge</li>
+                    </ol>
+                    
+                    <div class="warning">
+                        <strong>⚠️ Didn't request this?</strong><br>
+                        If you didn't create a NullChat account, please ignore this email.
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <div class="footer-logo">nullchat</div>
+                    <div class="app-description">
+                        Discord-to-web bridge service<br>
+                        Access Discord anywhere, even when blocked
+                    </div>
+                    <p style="font-size: 11px; color: #888; margin-top: 15px;">
+                        This email was sent to {email} as part of the NullChat account creation process.
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(html, 'html'))
+        
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(APP_EMAIL, APP_PASS)
+            server.send_message(msg)
+        
+        return True
+    except Exception as e:
+        print(f"Email error: {e}")
+        return False
+
+def verify_user_token(req):
+    """Verify user session token"""
     auth = req.headers.get('Authorization')
-    return auth == f'Bearer {API_SECRET}'
+    if not auth or not auth.startswith('Bearer '):
+        return None
+    
+    token = auth.replace('Bearer ', '')
+    
+    session = sessions_collection.find_one({'token': token})
+    if not session:
+        return None
+    
+    # Check if token expired
+    if time.time() > session['expiry']:
+        sessions_collection.delete_one({'token': token})
+        return None
+    
+    # Update last used time
+    sessions_collection.update_one(
+        {'token': token},
+        {'$set': {'last_used': time.time()}}
+    )
+    
+    return session
+
+def create_session(username):
+    """Create a new session token for user"""
+    token = generate_token()
+    expiry = time.time() + (24 * 60 * 60)  # 24 hours
+    
+    sessions_collection.insert_one({
+        'token': token,
+        'username': username,
+        'expiry': expiry,
+        'created_at': time.time(),
+        'last_used': time.time()
+    })
+    
+    return token, expiry
 
 async def get_avatar_base64(user):
     """Get user avatar as base64"""
@@ -73,13 +374,11 @@ async def get_or_create_webhook(channel):
     webhooks = await channel.webhooks()
     webhook = None
     
-    # Look for existing webhook
     for wh in webhooks:
         if wh.user == bot.user:
             webhook = wh
             break
     
-    # Create new webhook if none exists
     if not webhook:
         webhook = await channel.create_webhook(name="Voidagon Bridge")
     
@@ -92,11 +391,9 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
     bot_status['ready'] = True
     bot_status['start_time'] = time.time()
-    bot_status['guilds_count'] = len(bot.guilds)
 
 @bot.event
 async def on_message(message):
-    """Cache messages as they come in"""
     if message.author.bot:
         return
     
@@ -107,10 +404,8 @@ async def on_message(message):
     if channel_id not in message_cache:
         message_cache[channel_id] = deque(maxlen=MAX_CACHED_MESSAGES)
     
-    # Get avatar as base64
     avatar_b64 = await get_avatar_base64(message.author)
     
-    # Get user roles
     roles = []
     if hasattr(message.author, 'roles'):
         roles = [{'id': str(r.id), 'name': r.name, 'color': str(r.color)} 
@@ -136,41 +431,469 @@ async def on_message(message):
     
     await bot.process_commands(message)
 
-# API Routes
+# ============= WEB REGISTRATION PAGE =============
+
+REGISTRATION_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voidagon - Create Account</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            max-width: 450px;
+            width: 100%;
+        }
+        h1 {
+            color: #5865F2;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border 0.3s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #5865F2;
+        }
+        button {
+            width: 100%;
+            padding: 14px;
+            background: #5865F2;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #4752C4;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .message.error {
+            background: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
+        }
+        .message.success {
+            background: #efe;
+            color: #3c3;
+            border: 1px solid #cfc;
+        }
+        .step {
+            display: none;
+        }
+        .step.active {
+            display: block;
+        }
+        .code-input {
+            font-size: 24px;
+            text-align: center;
+            letter-spacing: 10px;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 15px;
+        }
+        .back-link a {
+            color: #5865F2;
+            text-decoration: none;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌌 Voidagon</h1>
+        <p class="subtitle">Create your account to access Discord bridge</p>
+        
+        <div id="message" class="message"></div>
+        
+        <!-- Step 1: Email & Password -->
+        <div id="step1" class="step active">
+            <form id="signupForm">
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" required placeholder="your@email.com">
+                </div>
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" required placeholder="Choose a username" minlength="3">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" required placeholder="At least 6 characters" minlength="6">
+                </div>
+                <button type="submit" id="signupBtn">Create Account</button>
+            </form>
+        </div>
+        
+        <!-- Step 2: Verification Code -->
+        <div id="step2" class="step">
+            <p style="margin-bottom: 20px; color: #666;">We've sent a verification code to <strong id="emailDisplay"></strong></p>
+            <form id="verifyForm">
+                <div class="form-group">
+                    <label for="code">Verification Code</label>
+                    <input type="text" id="code" required placeholder="000000" maxlength="6" class="code-input">
+                </div>
+                <button type="submit" id="verifyBtn">Verify & Login</button>
+            </form>
+            <div class="back-link">
+                <a href="#" id="resendCode">Resend code</a>
+            </div>
+        </div>
+        
+        <!-- Step 3: Success -->
+        <div id="step3" class="step">
+            <div style="text-align: center;">
+                <h2 style="color: #3c3; margin-bottom: 15px;">✅ Account Created!</h2>
+                <p style="color: #666; margin-bottom: 20px;">Your account has been verified successfully.</p>
+                <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                    <strong>Your Access Token:</strong>
+                    <div style="background: white; padding: 10px; margin-top: 10px; border-radius: 5px; word-break: break-all; font-family: monospace; font-size: 12px;" id="tokenDisplay"></div>
+                </div>
+                <p style="font-size: 12px; color: #888;">Save this token to use in your TurboWarp app!</p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentEmail = '';
+        
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = 'message ' + type;
+            msg.style.display = 'block';
+        }
+        
+        function showStep(step) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById('step' + step).classList.add('active');
+        }
+        
+        document.getElementById('signupForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('signupBtn');
+            btn.disabled = true;
+            btn.textContent = 'Sending verification email...';
+            
+            const email = document.getElementById('email').value;
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            try {
+                const res = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({email, username, password})
+                });
+                
+                const data = await res.json();
+                
+                if (res.ok) {
+                    currentEmail = email;
+                    document.getElementById('emailDisplay').textContent = email;
+                    showStep(2);
+                    showMessage('Verification code sent! Check your email.', 'success');
+                } else {
+                    showMessage(data.error || 'Registration failed', 'error');
+                    btn.disabled = false;
+                    btn.textContent = 'Create Account';
+                }
+            } catch (err) {
+                showMessage('Network error. Please try again.', 'error');
+                btn.disabled = false;
+                btn.textContent = 'Create Account';
+            }
+        });
+        
+        document.getElementById('verifyForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('verifyBtn');
+            btn.disabled = true;
+            btn.textContent = 'Verifying...';
+            
+            const code = document.getElementById('code').value;
+            
+            try {
+                const res = await fetch('/api/auth/verify', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({email: currentEmail, code})
+                });
+                
+                const data = await res.json();
+                
+                if (res.ok) {
+                    document.getElementById('tokenDisplay').textContent = data.token;
+                    showStep(3);
+                    showMessage('', '');
+                } else {
+                    showMessage(data.error || 'Invalid code', 'error');
+                    btn.disabled = false;
+                    btn.textContent = 'Verify & Login';
+                }
+            } catch (err) {
+                showMessage('Network error. Please try again.', 'error');
+                btn.disabled = false;
+                btn.textContent = 'Verify & Login';
+            }
+        });
+        
+        document.getElementById('resendCode').addEventListener('click', async (e) => {
+            e.preventDefault();
+            showMessage('Resending code...', 'success');
+            
+            try {
+                const res = await fetch('/api/auth/resend', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({email: currentEmail})
+                });
+                
+                if (res.ok) {
+                    showMessage('New code sent! Check your email.', 'success');
+                } else {
+                    showMessage('Failed to resend code', 'error');
+                }
+            } catch (err) {
+                showMessage('Network error', 'error');
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/', methods=['GET'])
+def registration_page():
+    """Serve registration page"""
+    return render_template_string(REGISTRATION_HTML)
+
+# ============= AUTHENTICATION ENDPOINTS =============
+
+@app.route('/api/auth/register', methods=['POST'])
+def register_user():
+    """Register a new user and send verification email"""
+    data = request.json
+    email = data.get('email')
+    username = data.get('username')
+    password = data.get('password')
+    
+    if not email or not username or not password:
+        return jsonify({'error': 'All fields required'}), 400
+    
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    
+    if len(username) < 3:
+        return jsonify({'error': 'Username must be at least 3 characters'}), 400
+    
+    # Check if user already exists
+    if users_collection.find_one({'$or': [{'email': email}, {'username': username}]}):
+        return jsonify({'error': 'Email or username already exists'}), 400
+    
+    # Generate verification code
+    code = generate_verification_code()
+    
+    # Store pending verification
+    verification_codes.delete_many({'email': email})  # Remove old codes
+    verification_codes.insert_one({
+        'email': email,
+        'username': username,
+        'password_hash': hash_password(password),
+        'code': code,
+        'created_at': time.time(),
+        'expires_at': time.time() + (15 * 60)  # 15 minutes
+    })
+    
+    # Send email
+    if not send_verification_email(email, code):
+        return jsonify({'error': 'Failed to send verification email'}), 500
+    
+    return jsonify({'success': True, 'message': 'Verification code sent to email'})
+
+@app.route('/api/auth/verify', methods=['POST'])
+def verify_email():
+    """Verify email with code and create account"""
+    data = request.json
+    email = data.get('email')
+    code = data.get('code')
+    
+    if not email or not code:
+        return jsonify({'error': 'Email and code required'}), 400
+    
+    # Find verification code
+    verification = verification_codes.find_one({'email': email, 'code': code})
+    
+    if not verification:
+        return jsonify({'error': 'Invalid verification code'}), 401
+    
+    # Check if expired
+    if time.time() > verification['expires_at']:
+        verification_codes.delete_one({'_id': verification['_id']})
+        return jsonify({'error': 'Verification code expired'}), 401
+    
+    # Create user account
+    users_collection.insert_one({
+        'email': email,
+        'username': verification['username'],
+        'password_hash': verification['password_hash'],
+        'created_at': time.time(),
+        'verified': True
+    })
+    
+    # Delete verification code
+    verification_codes.delete_one({'_id': verification['_id']})
+    
+    # Create session
+    token, expiry = create_session(verification['username'])
+    
+    return jsonify({
+        'success': True,
+        'token': token,
+        'expires_at': expiry,
+        'username': verification['username']
+    })
+
+@app.route('/api/auth/resend', methods=['POST'])
+def resend_code():
+    """Resend verification code"""
+    data = request.json
+    email = data.get('email')
+    
+    verification = verification_codes.find_one({'email': email})
+    if not verification:
+        return jsonify({'error': 'No pending verification found'}), 404
+    
+    # Generate new code
+    code = generate_verification_code()
+    
+    verification_codes.update_one(
+        {'email': email},
+        {'$set': {
+            'code': code,
+            'created_at': time.time(),
+            'expires_at': time.time() + (15 * 60)
+        }}
+    )
+    
+    if not send_verification_email(email, code):
+        return jsonify({'error': 'Failed to send email'}), 500
+    
+    return jsonify({'success': True})
+
+@app.route('/api/auth/login', methods=['POST'])
+def login_user():
+    """Login with username/email and password"""
+    data = request.json
+    username_or_email = data.get('username')
+    password = data.get('password')
+    
+    if not username_or_email or not password:
+        return jsonify({'error': 'Username/email and password required'}), 400
+    
+    # Find user by username or email
+    user = users_collection.find_one({
+        '$or': [
+            {'username': username_or_email},
+            {'email': username_or_email}
+        ]
+    })
+    
+    if not user or user['password_hash'] != hash_password(password):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    
+    # Create session
+    token, expiry = create_session(user['username'])
+    
+    return jsonify({
+        'success': True,
+        'token': token,
+        'expires_at': expiry,
+        'username': user['username']
+    })
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout_user():
+    """Logout and invalidate token"""
+    session = verify_user_token(request)
+    if not session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    auth = request.headers.get('Authorization', '').replace('Bearer ', '')
+    sessions_collection.delete_one({'token': auth})
+    
+    return jsonify({'success': True})
+
+# ============= DISCORD API ENDPOINTS =============
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Comprehensive health check endpoint"""
+    """Public health check"""
     uptime = None
     if bot_status['start_time']:
         uptime = int(time.time() - bot_status['start_time'])
     
     return jsonify({
         'status': 'healthy' if bot_status['ready'] else 'starting',
-        'bot': {
-            'ready': bot_status['ready'],
-            'connected': bot.is_ready(),
-            'latency_ms': round(bot.latency * 1000, 2) if bot.is_ready() else None,
-            'uptime_seconds': uptime,
-            'user': {
-                'id': str(bot.user.id) if bot.user else None,
-                'name': bot.user.name if bot.user else None
-            } if bot.user else None
-        },
-        'guilds': {
-            'count': len(bot.guilds),
-            'cached_messages': sum(len(cache) for cache in message_cache.values())
-        },
-        'api': {
-            'version': '1.0.0',
-            'endpoints_available': True
-        }
+        'uptime_seconds': uptime,
+        'active_sessions': sessions_collection.count_documents({}),
+        'registered_users': users_collection.count_documents({})
     })
 
 @app.route('/api/discord/status', methods=['GET'])
 def discord_status():
     """Check Discord connection status"""
-    if not verify_api_key(request):
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     return jsonify({
@@ -179,36 +902,27 @@ def discord_status():
 
 @app.route('/api/guilds', methods=['GET'])
 def get_guilds():
-    """Get all guilds (servers) the bot is in"""
-    if not verify_api_key(request):
+    """Get all guilds"""
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     guilds = []
     for guild in bot.guilds:
-        # Get server icon as base64
-        icon_b64 = None
-        if guild.icon:
-            icon_url = str(guild.icon.url)
-            guilds.append({
-                'id': str(guild.id),
-                'name': guild.name,
-                'icon_url': icon_url,
-                'member_count': guild.member_count
-            })
-        else:
-            guilds.append({
-                'id': str(guild.id),
-                'name': guild.name,
-                'icon_url': None,
-                'member_count': guild.member_count
-            })
+        guilds.append({
+            'id': str(guild.id),
+            'name': guild.name,
+            'icon_url': str(guild.icon.url) if guild.icon else None,
+            'member_count': guild.member_count
+        })
     
     return jsonify({'guilds': guilds})
 
 @app.route('/api/guilds/<guild_id>/channels', methods=['GET'])
 def get_channels(guild_id):
     """Get all channels in a guild"""
-    if not verify_api_key(request):
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     guild = bot.get_guild(int(guild_id))
@@ -230,11 +944,12 @@ def get_channels(guild_id):
 @app.route('/api/channels/<channel_id>/messages', methods=['GET'])
 def get_messages(channel_id):
     """Get last messages from a channel"""
-    if not verify_api_key(request):
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     limit = int(request.args.get('limit', 10))
-    limit = min(limit, 50)  # Cap at 50
+    limit = min(limit, 50)
     
     if channel_id not in message_cache:
         return jsonify({'messages': []})
@@ -244,19 +959,19 @@ def get_messages(channel_id):
 
 @app.route('/api/channels/<channel_id>/send', methods=['POST'])
 def send_message(channel_id):
-    """Send a message via webhook with custom username and avatar"""
-    if not verify_api_key(request):
+    """Send a message via webhook"""
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     data = request.json
     content = data.get('content')
-    username = data.get('username', 'Unknown User')
+    username = data.get('username', session['username'])
     avatar_base64 = data.get('avatar_base64')
     
     if not content:
         return jsonify({'error': 'Content required'}), 400
     
-    # Run async function in bot's event loop
     future = asyncio.run_coroutine_threadsafe(
         send_webhook_message(channel_id, content, username, avatar_base64),
         bot.loop
@@ -277,14 +992,6 @@ async def send_webhook_message(channel_id, content, username, avatar_base64):
         
         webhook = await get_or_create_webhook(channel)
         
-        # Convert base64 avatar to bytes if provided
-        avatar_bytes = None
-        if avatar_base64:
-            try:
-                avatar_bytes = base64.b64decode(avatar_base64)
-            except:
-                pass
-        
         await webhook.send(
             content=content,
             username=username,
@@ -297,8 +1004,9 @@ async def send_webhook_message(channel_id, content, username, avatar_base64):
 
 @app.route('/api/guilds/<guild_id>/members/<user_id>', methods=['GET'])
 def get_member_info(guild_id, user_id):
-    """Get member information including roles"""
-    if not verify_api_key(request):
+    """Get member information"""
+    session = verify_user_token(request)
+    if not session:
         return jsonify({'error': 'Unauthorized'}), 401
     
     guild = bot.get_guild(int(guild_id))
@@ -319,34 +1027,15 @@ def get_member_info(guild_id, user_id):
         'roles': roles
     })
 
-@app.route('/', methods=['GET'])
-def root():
-    """Root endpoint"""
-    return jsonify({
-        'name': 'Voidagon Discord Bridge API',
-        'version': '1.0.0',
-        'status': 'online',
-        'endpoints': {
-            'health': '/api/health',
-            'discord_status': '/api/discord/status',
-            'guilds': '/api/guilds',
-            'channels': '/api/guilds/{guild_id}/channels',
-            'messages': '/api/channels/{channel_id}/messages',
-            'send': '/api/channels/{channel_id}/send',
-            'member_info': '/api/guilds/{guild_id}/members/{user_id}'
-        }
-    })
-
 def run_flask():
     """Run Flask in a separate thread"""
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == '__main__':
-    # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Run Discord bot
     print("Starting Discord bot...")
     print(f"API will be available on port {PORT}")
+    print(f"Registration page: http://localhost:{PORT}/")
     bot.run(DISCORD_TOKEN)
