@@ -60,7 +60,62 @@ webhooks_cache = {}
 # Bot status tracking
 bot_status = {
     'ready': False,
-    'start_time': None,
+    'start_time': @app.route('/api/auth/register', methods=['POST'])
+def register_user():
+    """Register a new user and send verification email"""
+    try:
+        data = request.json
+        email = data.get('email')
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not email or not username or not password:
+            return jsonify({'error': 'All fields required'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+        
+        if len(username) < 3:
+            return jsonify({'error': 'Username must be at least 3 characters'}), 400
+        
+        # Check if user already exists
+        existing = users_collection.find_one({'$or': [{'email': email}, {'username': username}]})
+        if existing:
+            return jsonify({'error': 'Email or username already exists'}), 400
+        
+        # Generate verification code
+        code = generate_verification_code()
+        
+        # Store pending verification
+        verification_codes.delete_many({'email': email})
+        verification_codes.insert_one({
+            'email': email,
+            'username': username,
+            'password_hash': hash_password(password),
+            'code': code,
+            'created_at': time.time(),
+            'expires_at': time.time() + (15 * 60)
+        })
+        
+        # Send email in background thread so it doesn't block
+        def send_in_background():
+            try:
+                send_verification_email(email, code)
+            except Exception as e:
+                print(f"Background email error: {e}")
+        
+        import threading
+        email_thread = threading.Thread(target=send_in_background)
+        email_thread.daemon = True
+        email_thread.start()
+        
+        return jsonify({'success': True, 'message': 'Verification code sent to email'})
+    
+    except Exception as e:
+        print(f"ERROR in register_user: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500,
     'last_message_time': None
 }
 
@@ -907,11 +962,20 @@ def health_check():
     if bot_status['start_time']:
         uptime = int(time.time() - bot_status['start_time'])
     
+    # Check if critical env vars are set
+    env_status = {
+        'DISCORD_BOT_TOKEN': 'set' if DISCORD_TOKEN else 'missing',
+        'MONGODB': 'set' if MONGODB_URI else 'missing',
+        'APP_EMAIL': 'set' if APP_EMAIL else 'missing',
+        'APP_PASS': 'set' if APP_PASS else 'missing'
+    }
+    
     return jsonify({
         'status': 'healthy' if bot_status['ready'] else 'starting',
         'uptime_seconds': uptime,
         'active_sessions': sessions_collection.count_documents({}),
-        'registered_users': users_collection.count_documents({})
+        'registered_users': users_collection.count_documents({}),
+        'environment': env_status
     })
 
 @app.route('/api/discord/status', methods=['GET'])
