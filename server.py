@@ -34,7 +34,7 @@ if not APP_EMAIL or not APP_PASS:
 
 # MongoDB setup
 mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client['voidagon']
+db = mongo_client['nullchat']
 users_collection = db['users']
 sessions_collection = db['sessions']
 verification_codes = db['verification_codes']
@@ -303,13 +303,22 @@ def send_verification_email(email, code):
         
         msg.attach(MIMEText(html, 'html'))
         
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        # Set timeout to prevent hanging
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=10) as server:
             server.login(APP_EMAIL, APP_PASS)
             server.send_message(msg)
         
+        print(f"✓ Email sent successfully to {email}")
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"✗ Email authentication failed: {e}")
+        print(f"Check APP_EMAIL and APP_PASS environment variables")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"✗ SMTP error: {e}")
+        return False
     except Exception as e:
-        print(f"Email error: {e}")
+        print(f"✗ Email error: {e}")
         return False
 
 def verify_user_token(req):
@@ -722,43 +731,59 @@ def registration_page():
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
     """Register a new user and send verification email"""
-    data = request.json
-    email = data.get('email')
-    username = data.get('username')
-    password = data.get('password')
+    try:
+        data = request.json
+        email = data.get('email')
+        username = data.get('username')
+        password = data.get('password')
+        
+        print(f"Registration attempt: email={email}, username={username}")
+        
+        if not email or not username or not password:
+            return jsonify({'error': 'All fields required'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+        
+        if len(username) < 3:
+            return jsonify({'error': 'Username must be at least 3 characters'}), 400
+        
+        # Check if user already exists
+        existing = users_collection.find_one({'$or': [{'email': email}, {'username': username}]})
+        if existing:
+            print(f"User already exists: {existing}")
+            return jsonify({'error': 'Email or username already exists'}), 400
+        
+        # Generate verification code
+        code = generate_verification_code()
+        print(f"Generated verification code: {code}")
+        
+        # Store pending verification
+        verification_codes.delete_many({'email': email})  # Remove old codes
+        verification_codes.insert_one({
+            'email': email,
+            'username': username,
+            'password_hash': hash_password(password),
+            'code': code,
+            'created_at': time.time(),
+            'expires_at': time.time() + (15 * 60)  # 15 minutes
+        })
+        print(f"Stored verification code in database")
+        
+        # Send email
+        print(f"Attempting to send email to {email}...")
+        if not send_verification_email(email, code):
+            print(f"Failed to send email to {email}")
+            return jsonify({'error': 'Failed to send verification email. Check server logs.'}), 500
+        
+        print(f"Successfully sent verification email to {email}")
+        return jsonify({'success': True, 'message': 'Verification code sent to email'})
     
-    if not email or not username or not password:
-        return jsonify({'error': 'All fields required'}), 400
-    
-    if len(password) < 6:
-        return jsonify({'error': 'Password must be at least 6 characters'}), 400
-    
-    if len(username) < 3:
-        return jsonify({'error': 'Username must be at least 3 characters'}), 400
-    
-    # Check if user already exists
-    if users_collection.find_one({'$or': [{'email': email}, {'username': username}]}):
-        return jsonify({'error': 'Email or username already exists'}), 400
-    
-    # Generate verification code
-    code = generate_verification_code()
-    
-    # Store pending verification
-    verification_codes.delete_many({'email': email})  # Remove old codes
-    verification_codes.insert_one({
-        'email': email,
-        'username': username,
-        'password_hash': hash_password(password),
-        'code': code,
-        'created_at': time.time(),
-        'expires_at': time.time() + (15 * 60)  # 15 minutes
-    })
-    
-    # Send email
-    if not send_verification_email(email, code):
-        return jsonify({'error': 'Failed to send verification email'}), 500
-    
-    return jsonify({'success': True, 'message': 'Verification code sent to email'})
+    except Exception as e:
+        print(f"ERROR in register_user: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/auth/verify', methods=['POST'])
 def verify_email():
