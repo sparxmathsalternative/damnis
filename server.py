@@ -12,6 +12,7 @@ import time
 import aiohttp
 from collections import deque
 from pymongo import MongoClient
+from datetime import datetime
 
 # Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -24,16 +25,195 @@ db = mongo_client['nullchat']
 users_collection = db['users']
 sessions_collection = db['sessions']
 
-bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
+# Bot Setup
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix='!', intents=intents)
 app = Flask(__name__)
 CORS(app)
 
+# Global Cache
 message_cache = {}
 MAX_CACHED_MESSAGES = 50
 webhooks_cache = {}
+start_time = time.time()
 
 # ============= HELPERS =============
 
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_token():
+    return secrets.token_urlsafe(32)
+
+def generate_quick_code():
+    return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
+
+def verify_user_token(req):
+    # Check for Quick Code in URL params first
+    quick_code = req.args.get('code')
+    if quick_code:
+        user = users_collection.find_one({'quick_code': quick_code})
+        if user: return {'username': user['username'], 'id': str(user['_id'])}
+
+    # Check for Bearer Token in Headers
+    auth = req.headers.get('Authorization')
+    if not auth or not auth.startswith('Bearer '): return None
+    token = auth.replace('Bearer ', '')
+    session = sessions_collection.find_one({'token': token})
+    if not session or time.time() > session['expiry']: return None
+    return session
+
+def create_session(username):
+    token = generate_token()
+    expiry = time.time() + (24 * 60 * 60) # 24 Hour session
+    sessions_collection.insert_one({'token': token, 'username': username, 'expiry': expiry})
+    return token
+
+# ============= CORE API ROUTES =============
+
+@app.route('/')
+def index():
+    # Serves the Dashboard UI (Same as previous version)
+    return render_template_string(UI_HTML)
+
+@app.route('/api/discord/status', methods=['GET'])
+def get_discord_status():
+    """COMPLETELY PUBLIC: Returns 'up' or 'down'"""
+    return jsonify({'status': 'up' if bot.is_ready() else 'down'})
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Detailed system health"""
+    return jsonify({
+        'status': 'healthy',
+        'uptime': int(time.time() - start_time),
+        'discord_latency': round(bot.latency * 1000, 2) if bot.is_ready() else 0,
+        'db_connected': True if mongo_client.server_info() else False
+    })
+
+# ============= AUTH & USER ROUTES =============
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.json
+    u, e, p = data.get('username'), data.get('email'), data.get('password')
+    if not u or not e or not p: return jsonify({'error': 'Missing fields'}), 400
+    if users_collection.find_one({'$or': [{'username': u}, {'email': e}]}):
+        return jsonify({'error': 'Username or Email already taken'}), 400
+    
+    users_collection.insert_one({
+        'username': u, 'email': e, 'password_hash': hash_password(p),
+        'quick_code': generate_quick_code(), 'pfp': None, 'created_at': time.time()
+    })
+    return jsonify({'success': True, 'token': create_session(u)})
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json
+    u, p = data.get('username'), data.get('password')
+    user = users_collection.find_one({'username': u, 'password_hash': hash_password(p)})
+    if not user: return jsonify({'error': 'Invalid credentials'}), 401
+    return jsonify({'success': True, 'token': create_session(u)})
+
+@app.route('/api/user/me')
+def get_me():
+    session = verify_user_token(request)
+    if not session: return jsonify({'error': 'Unauthorized'}), 401
+    user = users_collection.find_one({'username': session['username']})
+    return jsonify({
+        'username': user['username'], 
+        'quick_code': user['quick_code'], 
+        'pfp': user.get('pfp')
+    })
+
+@app.route('/api/user/update-pfp', methods=['POST'])
+def update_pfp():
+    session = verify_user_token(request)
+    if not session: return jsonify({'error': 'Unauthorized'}), 401
+    users_collection.update_one({'username': session['username']}, {'$set': {'pfp': request.json.get('pfp')}})
+    return jsonify({'success': True})
+
+@app.route('/api/user/regen-code', methods=['POST'])
+def regen_code():
+    session = verify_user_token(request)
+    if not session: return jsonify({'error': 'Unauthorized'}), 401
+    new_code = generate_quick_code()
+    users_collection.update_one({'username': session['username']}, {'$set': {'quick_code': new_code}})
+    return jsonify({'success': True, 'code': new_code})
+
+# ============= DISCORD DATA ROUTES =============
+
+@app.route('/api/guilds', methods=['GET'])
+def get_guilds():
+    if not verify_user_token(request): return jsonify({'error': 'Unauthorized'}), 401
+    guilds = [{'id': str(g.id), 'name': g.name, 'icon': str(g.icon.url) if g.icon else None} for g in bot.guilds]
+    return jsonify({'guilds': guilds})
+
+@app.route('/api/guilds/<guild_id>/channels', methods=['GET'])
+def get_channels(guild_id):
+    if not verify_user_token(request): return jsonify({'error': 'Unauthorized'}), 401
+    guild = bot.get_guild(int(guild_id))
+    if not guild: return jsonify({'error': 'Guild not found'}), 404
+    channels = [{'id': str(c.id), 'name': c.name} for c in guild.text_channels]
+    return jsonify({'channels': channels})
+
+@app.route('/api/channels/<channel_id>/messages', methods=['GET'])
+def get_messages(channel_id):
+    if not verify_user_token(request): return jsonify({'error': 'Unauthorized'}), 401
+    msgs = list(message_cache.get(str(channel_id), []))
+    return jsonify({'messages': msgs})
+
+@app.route('/api/channels/<channel_id>/send', methods=['POST'])
+def send_msg(channel_id):
+    session = verify_user_token(request)
+    if not session: return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.json
+    user_db = users_collection.find_one({'username': session['username']})
+    
+    async def run():
+        channel = bot.get_channel(int(channel_id))
+        if not channel: return {'error': 'Channel not found'}
+        
+        webhooks = await channel.webhooks()
+        webhook = next((wh for wh in webhooks if wh.user == bot.user), None)
+        if not webhook: webhook = await channel.create_webhook(name="Voidagon Bridge")
+        
+        pfp = user_db.get('pfp')
+        await webhook.send(
+            content=data.get('content'),
+            username=session['username'],
+            avatar_url=f"data:image/png;base64,{pfp}" if pfp else None
+        )
+        return {'success': True}
+
+    future = asyncio.run_coroutine_threadsafe(run(), bot.loop)
+    return jsonify(future.result(timeout=10))
+
+# ============= DISCORD EVENTS =============
+
+@bot.event
+async def on_message(message):
+    if message.author.bot: return
+    cid = str(message.channel.id)
+    if cid not in message_cache: message_cache[cid] = deque(maxlen=50)
+    
+    message_cache[cid].append({
+        'id': str(message.id),
+        'author': message.author.name,
+        'content': message.content,
+        'timestamp': message.created_at.isoformat()
+    })
+
+# ============= UI HTML (Same as previous for consistency) =============
+UI_HTML = """... (Include Dashboard HTML from previous response here) ..."""
+
+def run_flask():
+    app.run(host='0.0.0.0', port=PORT)
+
+if __name__ == '__main__':
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.run(DISCORD_TOKEN)
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
